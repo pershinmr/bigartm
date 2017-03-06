@@ -8,6 +8,7 @@ import numpy as np
 
 from six import iteritems, string_types
 from six.moves import range, zip
+from scipy import sparse
 
 from . import wrapper
 from .wrapper import constants as const
@@ -79,14 +80,15 @@ class BatchVectorizer(object):
                                 process_in_memory == True. Will be ignored in other cases
         """
         self._remove_batches = False
-        self._process_in_memory = process_in_memory and data_format == 'batches' and model is not None
+        self._process_in_memory = process_in_memory and (data_format == 'batches' or data_format == 'bow_n_wd') and \
+                                  model is not None
         if self._process_in_memory != process_in_memory:
             raise IOError("Correct configuration: process_memory == True + data_format == 'batches' + model != None")
 
         self._model = model
-        if data_format == 'bow_n_wd' or data_format == 'vowpal_wabbit' or data_format == 'bow_uci':
+        if data_format == 'vowpal_wabbit' or data_format == 'bow_uci' or (data_format == 'bow_n_wd' and not self._process_in_memory):
             self._remove_batches = target_folder is None
-        elif data_format == 'batches':
+        elif data_format == 'batches' or (data_format == 'bow_n_wd' and self._process_in_memory):
             self._remove_batches = False
 
         self._target_folder = target_folder
@@ -226,7 +228,24 @@ class BatchVectorizer(object):
             batch.id = str(uuid.uuid4())
             return batch, {}
 
-        os.mkdir(self._target_folder)
+        def __column_token_generator(column):
+            generator = ()
+            if isinstance(column, np.ndarray):
+                generator = enumerate(column)
+            elif isinstance(column, np.matrix):
+                generator = enumerate(column.tolist()[0])
+            elif isinstance(column, sparse.lil_matrix):
+                generator = zip(column.rows[0], column.data[0])
+            elif isinstance(column, sparse.csr_matrix):
+                generator = zip(column.indices, column.data)
+            for data in generator:
+                yield data
+
+        if self._process_in_memory:
+            batches = []
+        else:
+            os.mkdir(self._target_folder)
+
         global_vocab, global_n = {}, 0.0
         batch, batch_vocab = __reset_batch()
         for item_id, column in enumerate(n_wd.T):
@@ -235,8 +254,7 @@ class BatchVectorizer(object):
             for key in global_vocab.keys():
                 global_vocab[key][2] = False  # all tokens haven't appeared in this item yet
 
-            col = column if isinstance(column, type(np.zeros([0]))) else column.tolist()[0]
-            for token_id, value in enumerate(col):
+            for token_id, value in __column_token_generator(column):
                 if value > GLOB_EPS:
                     token = vocab[token_id]
                     if token not in global_vocab:
@@ -254,14 +272,13 @@ class BatchVectorizer(object):
                     item.token_weight.append(float(value))
 
             if ((item_id + 1) % self._batch_size == 0 and item_id != 0) or ((item_id + 1) == n_wd.shape[1]):
-                filename = os.path.join(self._target_folder, '{}.batch'.format(batch.id))
-                with open(filename, 'wb') as fout:
-                    fout.write(batch.SerializeToString())
+                if self._process_in_memory:
+                    batches.append(batch)
+                else:
+                    filename = os.path.join(self._target_folder, '{}.batch'.format(batch.id))
+                    with open(filename, 'wb') as fout:
+                        fout.write(batch.SerializeToString())
                 batch, batch_vocab = __reset_batch()
-
-        batch_filenames = glob.glob(os.path.join(self._target_folder, '*.batch'))
-        self._batches_list += [Batch(filename) for filename in batch_filenames]
-        self._weights += [data_weight for i in range(len(batch_filenames))]
 
         dictionary_data = messages.DictionaryData()
         dictionary_data.name = uuid.uuid1().urn.replace(':', '')
@@ -272,6 +289,14 @@ class BatchVectorizer(object):
             dictionary_data.token_value.append(float(value[0]) / global_n)
 
         self._dictionary.create(dictionary_data)
+
+        if self._process_in_memory:
+            self._model.master.import_batches(batches)
+            self._batches_list = [str(batch.id) for batch in batches]
+        else:
+            batch_filenames = glob.glob(os.path.join(self._target_folder, '*.batch'))
+            self._batches_list += [Batch(filename) for filename in batch_filenames]
+            self._weights += [data_weight for i in range(len(batch_filenames))]
 
     @property
     def batches_list(self):
